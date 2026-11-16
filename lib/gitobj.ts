@@ -324,9 +324,24 @@ export function applyDelta(base: Buffer, delta: Buffer): Buffer {
   return result;
 }
 
-/** Inflate one deflate stream inside `buffer` starting at `pos`; binary-searches the consumed length. */
+/** Inflate one deflate stream inside `buffer` starting at `pos`, reporting the consumed length. */
 function inflateEntry(buffer: Buffer, pos: number): { data: Buffer; consumed: number } {
   const slice = buffer.subarray(pos);
+  // One pass: zlib's info report names the bytes the stream actually consumed,
+  // which is exactly where the next pack entry begins. Older engines without a
+  // sane report fall back to the binary search below.
+  try {
+    const out = inflateSync(slice, { info: true }) as unknown as {
+      buffer: Buffer;
+      engine: { bytesWritten?: unknown };
+    };
+    const consumed = out.engine?.bytesWritten;
+    if (typeof consumed === 'number' && consumed > 0 && consumed <= slice.length) {
+      return { data: out.buffer, consumed };
+    }
+  } catch {
+    // Not a complete stream at this offset: the search below surfaces the error.
+  }
   let lo = 1;
   let hi = slice.length;
   let best: Buffer | null = null;
@@ -418,6 +433,9 @@ export function readPack(pack: Buffer, externalBase?: (oid: string) => GitObject
     byOffset.set(entryOffset, raw.length);
     raw.push({ offset: entryOffset, type, data: inflated.data, baseOffset, baseOid });
   }
+  // The entries tile the pack exactly up to the trailer; a parse that lands
+  // anywhere else desynchronized and must not be trusted.
+  if (pos !== pack.length - 20) throw new Error('pack entries do not end where the trailer begins');
   const resolved: PackEntry[] = new Array(raw.length);
   const resolving = new Set<number>();
   const resolve = (index: number): PackEntry => {

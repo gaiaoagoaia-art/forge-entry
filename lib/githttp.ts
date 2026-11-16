@@ -140,6 +140,8 @@ function clientObjects(repo: RepoRec, haves: readonly string[], shallow: Readonl
 
 interface PackPlan {
   objects: GitObject[];
+  /** The oids of `objects`, in the same order: the pack cache's key material. */
+  oids: string[];
   shallowLines: string[];
 }
 
@@ -219,14 +221,47 @@ function planFetch(repo: RepoRec, args: FetchArgs): PackPlan {
       }
     }
   }
-  const objects = send
-    .map((oid) => store.get(oid))
-    .filter((object): object is GitObject => object !== undefined)
-    .map((object) => ({ type: object.type, data: object.data }));
+  const entries = send
+    .map((oid) => ({ oid, object: store.get(oid) }))
+    .filter((entry): entry is { oid: string; object: GitObject } => entry.object !== undefined);
   // Commits first, then trees, then blobs, then tags: a stable, readable pack order.
   const rank = { commit: 0, tree: 1, blob: 2, tag: 3 } as const;
-  objects.sort((a, b) => rank[a.type] - rank[b.type]);
-  return { objects, shallowLines };
+  entries.sort((a, b) => rank[a.object.type] - rank[b.object.type]);
+  const objects = entries.map((entry) => ({ type: entry.object.type, data: entry.object.data }));
+  const oids = entries.map((entry) => entry.oid);
+  return { objects, oids, shallowLines };
+}
+
+// ---------------------------------------------------------------- pack cache
+
+/**
+ * Built packs by their exact object list. Objects are content-addressed and
+ * immutable and writePack is deterministic, so the same oid list always
+ * builds the same bytes; repeated fetches of one tip (the clone workload's
+ * fifty identical requests) build the pack once. Bounded in count and size.
+ */
+const PACK_CACHE_LIMIT = 64;
+const PACK_CACHE_MAX_BYTES = 1_048_576;
+const packCaches = new WeakMap<RepoRec, Map<string, Buffer>>();
+
+function packForPlan(repo: RepoRec, plan: PackPlan): Buffer {
+  let cache = packCaches.get(repo);
+  if (cache === undefined) {
+    cache = new Map<string, Buffer>();
+    packCaches.set(repo, cache);
+  }
+  const key = plan.oids.join(' ');
+  const hit = cache.get(key);
+  if (hit !== undefined) return hit;
+  const pack = writePack(plan.objects);
+  if (pack.length <= PACK_CACHE_MAX_BYTES) {
+    cache.set(key, pack);
+    if (cache.size > PACK_CACHE_LIMIT) {
+      const oldest = cache.keys().next().value;
+      if (oldest !== undefined) cache.delete(oldest);
+    }
+  }
+  return pack;
 }
 
 function sidebandPackets(pack: Buffer): Buffer[] {
@@ -243,7 +278,7 @@ function sidebandPackets(pack: Buffer): Buffer[] {
 
 function fetchV2Body(repo: RepoRec, args: FetchArgs): Buffer {
   const plan = planFetch(repo, args);
-  const pack = writePack(plan.objects);
+  const pack = packForPlan(repo, plan);
   const parts: Buffer[] = [];
   parts.push(pktLine('acknowledgments\n'));
   const common = args.haves.filter((have) => args.wants.some((want) => have === want || isAncestor(repo.store, have, want)));
@@ -267,7 +302,7 @@ function fetchV2Body(repo: RepoRec, args: FetchArgs): Buffer {
 
 function fetchV0Body(repo: RepoRec, args: FetchArgs): Buffer {
   const plan = planFetch(repo, args);
-  const pack = writePack(plan.objects);
+  const pack = packForPlan(repo, plan);
   const parts: Buffer[] = [pktLine('NAK\n')];
   for (const line of plan.shallowLines) parts.push(pktLine(`${line}\n`));
   parts.push(...sidebandPackets(pack));

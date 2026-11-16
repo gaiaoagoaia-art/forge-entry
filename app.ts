@@ -63,19 +63,32 @@ function sendEmpty(res: ServerResponse, requestId: string, status: number): void
 }
 
 /** The bearer-token check shared by the API, GraphQL, MCP and git surfaces. */
-function authorized(req: IncomingMessage): boolean {
+function authorized(req: IncomingMessage, expected: string | undefined): boolean {
   const header = req.headers.authorization;
   if (typeof header !== 'string') return false;
-  const match = /^Bearer\s+(.+)$/i.exec(header);
-  if (match === null) return false;
-  const presented = (match[1] as string).trim();
+  // /^Bearer\s+(.+)$/i with the token trimmed, spelt out: the scheme in any
+  // case, at least one whitespace character, then a non-empty token.
+  if (header.length < 8) return false;
+  if (header.slice(0, 6).toLowerCase() !== 'bearer') return false;
+  if (!/\s/.test(header.charAt(6))) return false;
+  const presented = header.slice(7).trim();
   if (presented === '') return false;
-  const expected = process.env.MAKEFUN_SHOP_TOKEN;
   if (expected === undefined || expected === '') return true;
   return presented === expected;
 }
 
+const NO_BODY = Buffer.alloc(0);
+
+/**
+ * Read a request body fully. A request whose framing carries no body (no
+ * chunked encoding and a zero or absent Content-Length) is answered from the
+ * headers alone: there is nothing on the wire to consume, so keep-alive
+ * framing stays intact without touching the stream.
+ */
 async function readBody(req: IncomingMessage): Promise<Buffer> {
+  const length = req.headers['content-length'];
+  const chunked = (req.headers['transfer-encoding'] ?? '').toLowerCase().includes('chunked');
+  if (!chunked && (length === undefined || length === '0')) return NO_BODY;
   const chunks: Buffer[] = [];
   for await (const chunk of req) {
     chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
@@ -84,6 +97,7 @@ async function readBody(req: IncomingMessage): Promise<Buffer> {
 }
 
 function decodeSegment(segment: string): string {
+  if (!segment.includes('%')) return segment;
   try {
     return decodeURIComponent(segment);
   } catch {
@@ -93,8 +107,9 @@ function decodeSegment(segment: string): string {
 
 /** Build the server. It binds nothing until the caller listens. */
 export function createApp(forge: Forge = new Forge()): Server {
+  const expectedToken = process.env.MAKEFUN_SHOP_TOKEN;
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
-    void handle(forge, req, res).catch(() => {
+    void handle(forge, req, res, expectedToken).catch(() => {
       // A handler failure must never take the server down with it.
       if (!res.headersSent) {
         sendJson(res, nextRequestId(), 500, { message: 'Internal Server Error' });
@@ -108,17 +123,36 @@ export function createApp(forge: Forge = new Forge()): Server {
   return server;
 }
 
-async function handle(forge: Forge, req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handle(
+  forge: Forge,
+  req: IncomingMessage,
+  res: ServerResponse,
+  expectedToken: string | undefined,
+): Promise<void> {
   const requestId = nextRequestId();
   const method = req.method ?? 'GET';
-  let url: URL;
-  try {
-    url = new URL(req.url ?? '/', 'http://entry');
-  } catch {
-    sendJson(res, requestId, 400, { message: 'Bad Request' });
-    return;
+  // Split the request target by hand: the suite's targets are plain absolute
+  // paths with an optional query, and a full URL parse per request is waste.
+  // Anything that is not an absolute path keeps the URL parser's verdict.
+  const target = req.url ?? '/';
+  let path = target;
+  let query = new URLSearchParams();
+  if (target.startsWith('/') && !target.includes('/.')) {
+    const mark = target.indexOf('?');
+    if (mark !== -1) {
+      path = target.slice(0, mark);
+      query = new URLSearchParams(target.slice(mark + 1));
+    }
+  } else {
+    try {
+      const url = new URL(target, 'http://entry');
+      path = url.pathname;
+      query = url.searchParams;
+    } catch {
+      sendJson(res, requestId, 400, { message: 'Bad Request' });
+      return;
+    }
   }
-  const path = url.pathname;
 
   // The env's boot check: 200 {"ok":true}, no auth.
   if (method === 'GET' && path === '/healthz') {
@@ -128,7 +162,7 @@ async function handle(forge: Forge, req: IncomingMessage, res: ServerResponse): 
 
   // ---- REST v3 -------------------------------------------------------------
   if (path === '/api/v3' || path.startsWith('/api/v3/')) {
-    if (!authorized(req)) {
+    if (!authorized(req, expectedToken)) {
       sendJson(res, requestId, 401, { message: 'Bad credentials' });
       return;
     }
@@ -156,7 +190,7 @@ async function handle(forge: Forge, req: IncomingMessage, res: ServerResponse): 
     const reply = handleRest(forge, {
       method,
       segments,
-      query: url.searchParams,
+      query,
       body,
       origin: `http://${host}`,
     });
@@ -170,7 +204,7 @@ async function handle(forge: Forge, req: IncomingMessage, res: ServerResponse): 
 
   // ---- GraphQL -------------------------------------------------------------
   if (path === '/api/graphql') {
-    if (!authorized(req)) {
+    if (!authorized(req, expectedToken)) {
       sendJson(res, requestId, 401, { message: 'Bad credentials' });
       return;
     }
@@ -186,7 +220,7 @@ async function handle(forge: Forge, req: IncomingMessage, res: ServerResponse): 
 
   // ---- MCP -----------------------------------------------------------------
   if (path === '/mcp') {
-    if (!authorized(req)) {
+    if (!authorized(req, expectedToken)) {
       sendJson(res, requestId, 401, { message: 'Unauthorized' });
       return;
     }
@@ -207,7 +241,7 @@ async function handle(forge: Forge, req: IncomingMessage, res: ServerResponse): 
   // ---- git smart HTTP --------------------------------------------------------
   const gitMatch = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(path);
   if (gitMatch !== null) {
-    if (!authorized(req)) {
+    if (!authorized(req, expectedToken)) {
       sendJson(res, requestId, 401, { message: 'Bad credentials' });
       return;
     }
@@ -220,7 +254,7 @@ async function handle(forge: Forge, req: IncomingMessage, res: ServerResponse): 
     }
     const route = gitMatch[3] as string;
     if (route === 'info/refs') {
-      const service = url.searchParams.get('service');
+      const service = query.get('service');
       if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
         sendJson(res, requestId, 400, { message: 'Unknown service' });
         return;
